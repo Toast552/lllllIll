@@ -65,6 +65,13 @@ import {
   getAgeLimitSetting,
   getRatingCountry,
 } from "../utils/ageRating";
+import {
+  GAMEPAD_PLAYER_SCRIPT,
+  GAMEPAD_EXIT_CHECK_JS,
+  GAMEPAD_EXIT_RESET_JS,
+  GAMEPAD_CLEANUP_JS,
+} from "../utils/playerGamepadScript";
+import { setPlayerGamepadActive } from "../utils/gamepadPlayerState";
 
 // ── Partial-circle progress icon (cached per pct tier) ───────────────────────
 // Uses a single SVG arc. Three instances (25/50/75)
@@ -1452,6 +1459,62 @@ export default function TVPage({
       } catch {}
     };
   }, [playing, playerSource]);
+
+  // ── Controller support: play/pause, seek, volume, fullscreen ─────────────
+  // Runs for any source (not just async ones) since it only needs a <video>
+  // element inside the webview. Also lets the app-wide gamepad navigation
+  // (App.jsx) know to stand down while a video is actually playing.
+  // Only active while the "controller support" setting is on.
+  const [gamepadEnabled, setGamepadEnabled] = useState(
+    () => storage.get(STORAGE_KEYS.GAMEPAD_ENABLED) !== false, // default on
+  );
+  useEffect(() => {
+    const handler = () =>
+      setGamepadEnabled(storage.get(STORAGE_KEYS.GAMEPAD_ENABLED) !== false);
+    window.addEventListener("streambert:gamepad-settings-changed", handler);
+    return () =>
+      window.removeEventListener(
+        "streambert:gamepad-settings-changed",
+        handler,
+      );
+  }, []);
+
+  useEffect(() => {
+    setPlayerGamepadActive(gamepadEnabled && playing);
+    return () => setPlayerGamepadActive(false);
+  }, [playing, gamepadEnabled]);
+
+  useEffect(() => {
+    const wv = webviewRef.current;
+    if (!wv || !playing || !gamepadEnabled) return;
+
+    const inject = () => {
+      wv.executeJavaScript(GAMEPAD_PLAYER_SCRIPT).catch(() => {});
+    };
+    wv.addEventListener("dom-ready", inject);
+    try {
+      inject();
+    } catch {}
+
+    // Poll for a B-button "leave the player" request from the guest script.
+    const exitPoll = setInterval(async () => {
+      try {
+        const requested = await wv.executeJavaScript(GAMEPAD_EXIT_CHECK_JS);
+        if (requested) {
+          wv.executeJavaScript(GAMEPAD_EXIT_RESET_JS).catch(() => {});
+          setPlaying(false);
+        }
+      } catch {}
+    }, 250);
+
+    return () => {
+      wv.removeEventListener("dom-ready", inject);
+      clearInterval(exitPoll);
+      try {
+        wv.executeJavaScript(GAMEPAD_CLEANUP_JS);
+      } catch {}
+    };
+  }, [playing, gamepadEnabled]);
 
   const playEpisode = useCallback(
     (ep) => {
